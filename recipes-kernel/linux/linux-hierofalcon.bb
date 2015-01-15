@@ -10,8 +10,6 @@ inherit kernel siteinfo
 MACHINE_KERNEL_PR_append = "b+gitr${SRCPV}"
 PR = "${MACHINE_KERNEL_PR}"
 
-KERNEL_DEVICETREE = "arch/arm64/boot/dts/amd/amd-overdrive.dts"
-
 # SRCREV = "eaa27f34e91a14cdceed26ed6c6793ec1d186115"
 SRC_URI = "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git;nobranch=1;tag="v3.19-rc4";protocol=git \
            file://amdconfig \
@@ -23,6 +21,7 @@ DEPENDS += "libgcc"
 S = "${WORKDIR}/git"
 
 KERNEL_LOCALVERSION ?= ""
+KERNEL_EXTRA_ARGS += "dtbs"
 
 addtask setup_defconfig before do_configure after do_patch
 do_setup_defconfig() {
@@ -40,4 +39,8 @@ do_configure() {
     else
         yes '' | oe_runmake oldconfig
     fi
+}
+
+do_deploy_append() {
+    install -m 0644 ${B}/arch/arm64/boot/dts/amd/amd-overdrive.dtb ${DEPLOYDIR}/${KERNEL_IMAGE_BASE_NAME}.dtb
 }
