@@ -10,8 +10,8 @@ inherit kernel siteinfo
 MACHINE_KERNEL_PR_append = "b+gitr${SRCPV}"
 PR = "${MACHINE_KERNEL_PR}"
 
-# SRCREV = "eaa27f34e91a14cdceed26ed6c6793ec1d186115"
-SRC_URI = "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git;nobranch=1;tag="v3.19-rc4";protocol=git \
+SRCREV = "6713ff4d26ff95ba1f5491eba6d624557831498e"
+SRC_URI = "git://git.fedorahosted.org/git/kernel-arm64.git;branch="devel";protocol=git \
            file://amdconfig \
            file://defconfig \
            "
