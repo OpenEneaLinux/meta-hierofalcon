@@ -14,6 +14,7 @@ SRCREV = "6713ff4d26ff95ba1f5491eba6d624557831498e"
 SRC_URI = "git://git.fedorahosted.org/git/kernel-arm64.git;branch="devel";protocol=git \
            file://01-arm64-boot-BE-kernels-from-UEFI.patch \
            file://02-Hierofalcon-Enable-32-bit-EL0-with-64K-and-4K-page-s.patch \
+           file://03-arm64-psci-tell-the-compiler-which-registers-we-are-.patch \
            file://amdconfig \
            file://defconfig \
            "
