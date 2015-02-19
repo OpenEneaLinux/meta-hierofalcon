@@ -12,6 +12,7 @@ PR = "${MACHINE_KERNEL_PR}"
 
 SRCREV = "6713ff4d26ff95ba1f5491eba6d624557831498e"
 SRC_URI = "git://git.fedorahosted.org/git/kernel-arm64.git;branch="devel";protocol=git \
+           file://01-arm64-boot-BE-kernels-from-UEFI.patch \
            file://amdconfig \
            file://defconfig \
            "
@@ -24,14 +25,17 @@ KERNEL_LOCALVERSION ?= ""
 KERNEL_EXTRA_ARGS += "dtbs"
 
 addtask setup_defconfig before do_configure after do_patch
+
+KBIGEND = ""
+KBIGEND_aarch64-be = "CONFIG_CPU_BIG_ENDIAN=y"
 do_setup_defconfig() {
+    echo "${KBIGEND}" >> ${WORKDIR}/amdconfig
+
     cp ${WORKDIR}/amdconfig ${S}/arch/arm64/configs/amd_defconfig
     cp ${WORKDIR}/defconfig ${S}/.config
 }
 
 do_configure() {
-    echo ${KERNEL_LOCALVERSION} > ${B}/.scmversion
-    echo ${KERNEL_LOCALVERSION} > ${S}/.scmversion
     config=`cat ${S}/.config | grep use-kernel-config | cut -d= -f2`
     if [ "x${config}" != "x" ]
     then
