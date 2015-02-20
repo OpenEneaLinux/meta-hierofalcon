@@ -1,1 +1,4 @@
-1) for now use the arch-armv8 from meta-enea/conf/machine/include
+meta-hierofalcon
+================
+
+This is the location for AMD Hierofalcon maintained BSP.
