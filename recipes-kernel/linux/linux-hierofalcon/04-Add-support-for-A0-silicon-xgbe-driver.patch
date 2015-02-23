@@ -1,0 +1,1803 @@
+From 0da3b8a1418d260e474816b01d63f8c074e6e3bb Mon Sep 17 00:00:00 2001
+From: Adrian Calianu <adrian.calianu@enea.com>
+Date: Mon, 23 Feb 2015 16:27:54 +0100
+Subject: [PATCH 1/1] Add support for A0 silicon xgbe driver
+
+Signed-off-by: Adrian Calianu <adrian.calianu@enea.com>
+---
+ drivers/net/ethernet/amd/xgbe/xgbe-common.h |   9 +-
+ drivers/net/ethernet/amd/xgbe/xgbe-dev.c    |  20 +-
+ drivers/net/ethernet/amd/xgbe/xgbe-drv.c    |   7 +-
+ drivers/net/ethernet/amd/xgbe/xgbe-main.c   | 288 ++++++++---
+ drivers/net/ethernet/amd/xgbe/xgbe-mdio.c   |  20 +-
+ drivers/net/ethernet/amd/xgbe/xgbe-ptp.c    |   4 +-
+ drivers/net/ethernet/amd/xgbe/xgbe.h        |  13 +
+ drivers/net/phy/amd-xgbe-phy.c              | 777 +++++++++++++++-------------
+ 8 files changed, 688 insertions(+), 450 deletions(-)
+
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-common.h b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+index 29a0927..75b08c6 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-common.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+@@ -767,17 +767,16 @@
+ #define MTL_Q_RQOMR			0x40
+ #define MTL_Q_RQMPOCR			0x44
+ #define MTL_Q_RQDR			0x4c
+-#define MTL_Q_RQFCR			0x50
+ #define MTL_Q_IER			0x70
+ #define MTL_Q_ISR			0x74
+ 
+ /* MTL queue register entry bit positions and sizes */
+-#define MTL_Q_RQFCR_RFA_INDEX		1
+-#define MTL_Q_RQFCR_RFA_WIDTH		6
+-#define MTL_Q_RQFCR_RFD_INDEX		17
+-#define MTL_Q_RQFCR_RFD_WIDTH		6
+ #define MTL_Q_RQOMR_EHFC_INDEX		7
+ #define MTL_Q_RQOMR_EHFC_WIDTH		1
++#define MTL_Q_RQOMR_RFA_INDEX		8
++#define MTL_Q_RQOMR_RFA_WIDTH		3
++#define MTL_Q_RQOMR_RFD_INDEX		13
++#define MTL_Q_RQOMR_RFD_WIDTH		3
+ #define MTL_Q_RQOMR_RQS_INDEX		16
+ #define MTL_Q_RQOMR_RQS_WIDTH		9
+ #define MTL_Q_RQOMR_RSF_INDEX		5
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index 4c66cd1..3957e63 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@ -130,7 +130,7 @@ static unsigned int xgbe_usec_to_riwt(struct xgbe_prv_data *pdata,
+ 
+ 	DBGPR("-->xgbe_usec_to_riwt\n");
+ 
+-	rate = clk_get_rate(pdata->sysclk);
++	rate = pdata->sysclk_rate;
+ 
+ 	/*
+ 	 * Convert the input usec value to the watchdog timer value. Each
+@@ -153,7 +153,7 @@ static unsigned int xgbe_riwt_to_usec(struct xgbe_prv_data *pdata,
+ 
+ 	DBGPR("-->xgbe_riwt_to_usec\n");
+ 
+-	rate = clk_get_rate(pdata->sysclk);
++	rate = pdata->sysclk_rate;
+ 
+ 	/*
+ 	 * Convert the input watchdog timer value to the usec value. Each
+@@ -854,6 +854,18 @@ static int xgbe_read_mmd_regs(struct xgbe_prv_data *pdata, int prtad,
+ 	else
+ 		mmd_address = (pdata->mdio_mmd << 16) | (mmd_reg & 0xffff);
+ 
++	if (XGBE_SEATTLE_A0) {
++		/* The PCS implementation has reversed the devices in
++		 * package registers so we need to change 05 to 06 and
++		 * 06 to 05 if being read (these registers are readonly
++		 * so no need to do this in the write function)
++		 */
++		if ((mmd_address & 0xffff) == 0x05)
++			mmd_address = (mmd_address & ~0xffff) | 0x06;
++		else if ((mmd_address & 0xffff) == 0x06)
++			mmd_address = (mmd_address & ~0xffff) | 0x05;
++	}
++
+ 	/* The PCS registers are accessed using mmio. The underlying APB3
+ 	 * management interface uses indirect addressing to access the MMD
+ 	 * register sets. This requires accessing of the PCS register in two
+@@ -2079,10 +2091,10 @@ static void xgbe_config_flow_control_threshold(struct xgbe_prv_data *pdata)
+ 
+ 	for (i = 0; i < pdata->rx_q_count; i++) {
+ 		/* Activate flow control when less than 4k left in fifo */
+-		XGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_Q_RQFCR, RFA, 2);
++		XGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_Q_RQOMR, RFA, 2);
+ 
+ 		/* De-activate flow control when more than 6k left in fifo */
+-		XGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_Q_RQFCR, RFD, 4);
++		XGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_Q_RQOMR, RFD, 4);
+ 	}
+ }
+ 
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index e5ffb2c..0ed3379 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@ -523,7 +523,6 @@ void xgbe_get_all_hw_features(struct xgbe_prv_data *pdata)
+ 	hw_feat->sph           = XGMAC_GET_BITS(mac_hfr1, MAC_HWF1R, SPHEN);
+ 	hw_feat->tso           = XGMAC_GET_BITS(mac_hfr1, MAC_HWF1R, TSOEN);
+ 	hw_feat->dma_debug     = XGMAC_GET_BITS(mac_hfr1, MAC_HWF1R, DBGMEMA);
+-	hw_feat->rss           = XGMAC_GET_BITS(mac_hfr1, MAC_HWF1R, RSSEN);
+ 	hw_feat->tc_cnt	       = XGMAC_GET_BITS(mac_hfr1, MAC_HWF1R, NUMTC);
+ 	hw_feat->hash_table_size = XGMAC_GET_BITS(mac_hfr1, MAC_HWF1R,
+ 						  HASHTBLSZ);
+@@ -553,14 +552,16 @@ void xgbe_get_all_hw_features(struct xgbe_prv_data *pdata)
+ 		break;
+ 	}
+ 
+-	/* The Queue, Channel and TC counts are zero based so increment them
++	/* The Queue and Channel counts are zero based so increment them
+ 	 * to get the actual number
+ 	 */
+ 	hw_feat->rx_q_cnt++;
+ 	hw_feat->tx_q_cnt++;
+ 	hw_feat->rx_ch_cnt++;
+ 	hw_feat->tx_ch_cnt++;
+-	hw_feat->tc_cnt++;
++
++	/* A0 does not support NUMTC, hardcode it for now */
++	hw_feat->tc_cnt = XGBE_TC_CNT;
+ 
+ 	DBGPR("<--xgbe_get_all_hw_features\n");
+ }
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-main.c b/drivers/net/ethernet/amd/xgbe/xgbe-main.c
+index dbd3850..6f05c6d 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-main.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-main.c
+@@ -124,6 +124,7 @@
+ #include <linux/of.h>
+ #include <linux/of_net.h>
+ #include <linux/clk.h>
++#include <linux/acpi.h>
+ 
+ #include "xgbe.h"
+ #include "xgbe-common.h"
+@@ -161,6 +162,205 @@ static void xgbe_init_all_fptrs(struct xgbe_prv_data *pdata)
+ 	xgbe_init_function_ptrs_desc(&pdata->desc_if);
+ }
+ 
++static int xgbe_map_resources(struct xgbe_prv_data *pdata)
++{
++	struct platform_device *pdev = pdata->pdev;
++	struct device *dev = pdata->dev;
++	struct resource *res;
++
++	/* Obtain the mmio areas for the device */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	pdata->xgmac_regs = devm_ioremap_resource(dev, res);
++	if (IS_ERR(pdata->xgmac_regs)) {
++		dev_err(dev, "xgmac ioremap failed\n");
++		return PTR_ERR(pdata->xgmac_regs);
++	}
++	DBGPR("  xgmac_regs = %p\n", pdata->xgmac_regs);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	pdata->xpcs_regs = devm_ioremap_resource(dev, res);
++	if (IS_ERR(pdata->xpcs_regs)) {
++		dev_err(dev, "xpcs ioremap failed\n");
++		return PTR_ERR(pdata->xpcs_regs);
++	}
++	DBGPR("  xpcs_regs  = %p\n", pdata->xpcs_regs);
++
++	return 0;
++}
++
++#ifdef CONFIG_ACPI
++static int xgbe_acpi_support(struct xgbe_prv_data *pdata)
++{
++	struct acpi_device *adev = pdata->adev;
++	struct device *dev = pdata->dev;
++	const union acpi_object *property;
++	acpi_status status;
++	u64 cca;
++	unsigned int i;
++	int ret;
++
++	/* Map the memory resources */
++	ret = xgbe_map_resources(pdata);
++	if (ret)
++		return ret;
++
++	/* Obtain the system clock setting */
++	ret = acpi_dev_get_property(adev, XGBE_ACPI_DMA_FREQ, ACPI_TYPE_INTEGER,
++				    &property);
++	if (ret) {
++		dev_err(dev, "unable to obtain %s acpi property\n",
++			XGBE_ACPI_DMA_FREQ);
++		return ret;
++	}
++	pdata->sysclk_rate = property->integer.value;
++
++	/* Obtain the PTP clock setting */
++	ret = acpi_dev_get_property(adev, XGBE_ACPI_PTP_FREQ, ACPI_TYPE_INTEGER,
++				    &property);
++	if (ret) {
++		dev_err(dev, "unable to obtain %s acpi property\n",
++			XGBE_ACPI_PTP_FREQ);
++		return ret;
++	}
++	pdata->ptpclk_rate = property->integer.value;
++
++	/* Retrieve the MAC address */
++	ret = acpi_dev_get_property_array(adev, XGBE_ACPI_MAC_ADDR,
++					  ACPI_TYPE_INTEGER, &property);
++	if (ret) {
++		dev_err(dev, "unable to obtain %s acpi property\n",
++			XGBE_ACPI_MAC_ADDR);
++		return ret;
++	}
++	if (property->package.count != 6) {
++		dev_err(dev, "invalid %s acpi property\n",
++			XGBE_ACPI_MAC_ADDR);
++		return -EINVAL;
++	}
++	for (i = 0; i < property->package.count; i++) {
++		union acpi_object *obj = &property->package.elements[i];
++
++		pdata->mac_addr[i] = (u8)obj->integer.value;
++	}
++	if (!is_valid_ether_addr(pdata->mac_addr)) {
++		dev_err(dev, "invalid %s acpi property\n",
++			XGBE_ACPI_MAC_ADDR);
++		return -EINVAL;
++	}
++
++	/* Retrieve the PHY mode - it must be "xgmii" */
++	ret = acpi_dev_get_property(adev, XGBE_ACPI_PHY_MODE, ACPI_TYPE_STRING,
++				    &property);
++	if (ret) {
++		dev_err(dev, "unable to obtain %s acpi property\n",
++			XGBE_ACPI_PHY_MODE);
++		return ret;
++	}
++	if (strcmp(property->string.pointer,
++		   phy_modes(PHY_INTERFACE_MODE_XGMII))) {
++		dev_err(dev, "invalid %s acpi property\n",
++			XGBE_ACPI_PHY_MODE);
++		return -EINVAL;
++	}
++	pdata->phy_mode = PHY_INTERFACE_MODE_XGMII;
++
++#ifndef METHOD_NAME__CCA
++#define METHOD_NAME__CCA "_CCA"
++#endif
++	/* Set the device cache coherency values */
++	if (acpi_has_method(adev->handle, METHOD_NAME__CCA)) {
++		status = acpi_evaluate_integer(adev->handle, METHOD_NAME__CCA,
++					       NULL, &cca);
++		if (ACPI_FAILURE(status)) {
++			dev_err(dev, "error obtaining acpi _CCA method\n");
++			return -EINVAL;
++		}
++	} else {
++		cca = 0;
++	}
++
++	if (cca) {
++		pdata->axdomain = XGBE_DMA_OS_AXDOMAIN;
++		pdata->arcache = XGBE_DMA_OS_ARCACHE;
++		pdata->awcache = XGBE_DMA_OS_AWCACHE;
++	} else {
++		pdata->axdomain = XGBE_DMA_SYS_AXDOMAIN;
++		pdata->arcache = XGBE_DMA_SYS_ARCACHE;
++		pdata->awcache = XGBE_DMA_SYS_AWCACHE;
++	}
++
++	return 0;
++}
++#else   /* CONFIG_ACPI */
++static int xgbe_acpi_support(struct xgbe_prv_data *pdata)
++{
++	return -EINVAL;
++}
++#endif  /* CONFIG_ACPI */
++
++#ifdef CONFIG_OF
++static int xgbe_of_support(struct xgbe_prv_data *pdata)
++{
++	struct device *dev = pdata->dev;
++	const u8 *mac_addr;
++	int ret;
++
++	/* Map the memory resources */
++	ret = xgbe_map_resources(pdata);
++	if (ret)
++		return ret;
++
++	/* Obtain the system clock setting */
++	pdata->sysclk = devm_clk_get(dev, XGBE_DMA_CLOCK);
++	if (IS_ERR(pdata->sysclk)) {
++		dev_err(dev, "dma devm_clk_get failed\n");
++		return PTR_ERR(pdata->sysclk);
++	}
++	pdata->sysclk_rate = clk_get_rate(pdata->sysclk);
++
++	/* Obtain the PTP clock setting */
++	pdata->ptpclk = devm_clk_get(dev, XGBE_PTP_CLOCK);
++	if (IS_ERR(pdata->ptpclk)) {
++		dev_err(dev, "ptp devm_clk_get failed\n");
++		return PTR_ERR(pdata->ptpclk);
++	}
++	pdata->ptpclk_rate = clk_get_rate(pdata->ptpclk);
++
++	/* Retrieve the MAC address */
++	mac_addr = of_get_mac_address(dev->of_node);
++	if (!mac_addr) {
++		dev_err(dev, "invalid mac address for this device\n");
++		return -EINVAL;
++	}
++	memcpy(pdata->mac_addr, mac_addr, ETH_ALEN);
++
++	/* Retrieve the PHY mode - it must be "xgmii" */
++	pdata->phy_mode = of_get_phy_mode(dev->of_node);
++	if (pdata->phy_mode != PHY_INTERFACE_MODE_XGMII) {
++		dev_err(dev, "invalid phy-mode specified for this device\n");
++		return -EINVAL;
++	}
++
++	/* Set the device cache coherency values */
++	if (of_property_read_bool(dev->of_node, "dma-coherent")) {
++		pdata->axdomain = XGBE_DMA_OS_AXDOMAIN;
++		pdata->arcache = XGBE_DMA_OS_ARCACHE;
++		pdata->awcache = XGBE_DMA_OS_AWCACHE;
++	} else {
++		pdata->axdomain = XGBE_DMA_SYS_AXDOMAIN;
++		pdata->arcache = XGBE_DMA_SYS_ARCACHE;
++		pdata->awcache = XGBE_DMA_SYS_AWCACHE;
++	}
++
++	return 0;
++}
++#else   /* CONFIG_OF */
++static int xgbe_of_support(struct xgbe_prv_data *pdata)
++{
++	return -EINVAL;
++}
++#endif  /*CONFIG_OF */
++
+ static int xgbe_probe(struct platform_device *pdev)
+ {
+ 	struct xgbe_prv_data *pdata;
+@@ -168,8 +368,6 @@ static int xgbe_probe(struct platform_device *pdev)
+ 	struct xgbe_desc_if *desc_if;
+ 	struct net_device *netdev;
+ 	struct device *dev = &pdev->dev;
+-	struct resource *res;
+-	const u8 *mac_addr;
+ 	unsigned int i;
+ 	int ret;
+ 
+@@ -186,6 +384,7 @@ static int xgbe_probe(struct platform_device *pdev)
+ 	pdata = netdev_priv(netdev);
+ 	pdata->netdev = netdev;
+ 	pdata->pdev = pdev;
++	pdata->adev = ACPI_COMPANION(dev);
+ 	pdata->dev = dev;
+ 	platform_set_drvdata(pdev, netdev);
+ 
+@@ -212,40 +411,13 @@ static int xgbe_probe(struct platform_device *pdev)
+ 		goto err_io;
+ 	}
+ 
+-	/* Obtain the system clock setting */
+-	pdata->sysclk = devm_clk_get(dev, XGBE_DMA_CLOCK);
+-	if (IS_ERR(pdata->sysclk)) {
+-		dev_err(dev, "dma devm_clk_get failed\n");
+-		ret = PTR_ERR(pdata->sysclk);
+-		goto err_io;
+-	}
+-
+-	/* Obtain the PTP clock setting */
+-	pdata->ptpclk = devm_clk_get(dev, XGBE_PTP_CLOCK);
+-	if (IS_ERR(pdata->ptpclk)) {
+-		dev_err(dev, "ptp devm_clk_get failed\n");
+-		ret = PTR_ERR(pdata->ptpclk);
+-		goto err_io;
+-	}
+-
+-	/* Obtain the mmio areas for the device */
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	pdata->xgmac_regs = devm_ioremap_resource(dev, res);
+-	if (IS_ERR(pdata->xgmac_regs)) {
+-		dev_err(dev, "xgmac ioremap failed\n");
+-		ret = PTR_ERR(pdata->xgmac_regs);
+-		goto err_io;
+-	}
+-	DBGPR("  xgmac_regs = %p\n", pdata->xgmac_regs);
+-
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+-	pdata->xpcs_regs = devm_ioremap_resource(dev, res);
+-	if (IS_ERR(pdata->xpcs_regs)) {
+-		dev_err(dev, "xpcs ioremap failed\n");
+-		ret = PTR_ERR(pdata->xpcs_regs);
++	/* Obtain device settings */
++	if (pdata->adev && !acpi_disabled)
++		ret = xgbe_acpi_support(pdata);
++	else
++		ret = xgbe_of_support(pdata);
++	if (ret)
+ 		goto err_io;
+-	}
+-	DBGPR("  xpcs_regs  = %p\n", pdata->xpcs_regs);
+ 
+ 	/* Set the DMA mask */
+ 	if (!dev->dma_mask)
+@@ -256,20 +428,11 @@ static int xgbe_probe(struct platform_device *pdev)
+ 		goto err_io;
+ 	}
+ 
+-	if (of_property_read_bool(dev->of_node, "dma-coherent")) {
+-		pdata->axdomain = XGBE_DMA_OS_AXDOMAIN;
+-		pdata->arcache = XGBE_DMA_OS_ARCACHE;
+-		pdata->awcache = XGBE_DMA_OS_AWCACHE;
+-	} else {
+-		pdata->axdomain = XGBE_DMA_SYS_AXDOMAIN;
+-		pdata->arcache = XGBE_DMA_SYS_ARCACHE;
+-		pdata->awcache = XGBE_DMA_SYS_AWCACHE;
+-	}
+-
+ 	/* Check for per channel interrupt support */
+ 	if (of_property_read_bool(dev->of_node, XGBE_DMA_IRQS))
+ 		pdata->per_channel_irq = 1;
+ 
++	/* Get the device interrupt */
+ 	ret = platform_get_irq(pdev, 0);
+ 	if (ret < 0) {
+ 		dev_err(dev, "platform_get_irq 0 failed\n");
+@@ -279,6 +442,7 @@ static int xgbe_probe(struct platform_device *pdev)
+ 
+ 	netdev->irq = pdata->dev_irq;
+ 	netdev->base_addr = (unsigned long)pdata->xgmac_regs;
++	memcpy(netdev->dev_addr, pdata->mac_addr, netdev->addr_len);
+ 
+ 	/* Set all the function pointers */
+ 	xgbe_init_all_fptrs(pdata);
+@@ -291,23 +455,6 @@ static int xgbe_probe(struct platform_device *pdev)
+ 	/* Populate the hardware features */
+ 	xgbe_get_all_hw_features(pdata);
+ 
+-	/* Retrieve the MAC address */
+-	mac_addr = of_get_mac_address(dev->of_node);
+-	if (!mac_addr) {
+-		dev_err(dev, "invalid mac address for this device\n");
+-		ret = -EINVAL;
+-		goto err_io;
+-	}
+-	memcpy(netdev->dev_addr, mac_addr, netdev->addr_len);
+-
+-	/* Retrieve the PHY mode - it must be "xgmii" */
+-	pdata->phy_mode = of_get_phy_mode(dev->of_node);
+-	if (pdata->phy_mode != PHY_INTERFACE_MODE_XGMII) {
+-		dev_err(dev, "invalid phy-mode specified for this device\n");
+-		ret = -EINVAL;
+-		goto err_io;
+-	}
+-
+ 	/* Set default configuration data */
+ 	xgbe_default_config(pdata);
+ 
+@@ -491,10 +638,22 @@ static int xgbe_resume(struct device *dev)
+ }
+ #endif /* CONFIG_PM */
+ 
++#ifdef CONFIG_ACPI
++static const struct acpi_device_id xgbe_acpi_match[] = {
++	{ "AMDI8000", 0 },
++	{},
++};
++
++MODULE_DEVICE_TABLE(acpi, xgbe_acpi_match);
++#endif
++
++#ifdef CONFIG_OF
+ static const struct of_device_id xgbe_of_match[] = {
++	{ .compatible = "amd,xgbe-seattle-v0a", },
+ 	{ .compatible = "amd,xgbe-seattle-v1a", },
+ 	{},
+ };
++#endif
+ 
+ MODULE_DEVICE_TABLE(of, xgbe_of_match);
+ static SIMPLE_DEV_PM_OPS(xgbe_pm_ops, xgbe_suspend, xgbe_resume);
+@@ -502,7 +661,12 @@ static SIMPLE_DEV_PM_OPS(xgbe_pm_ops, xgbe_suspend, xgbe_resume);
+ static struct platform_driver xgbe_driver = {
+ 	.driver = {
+ 		.name = "amd-xgbe",
++#ifdef CONFIG_ACPI
++		.acpi_match_table = xgbe_acpi_match,
++#endif
++#ifdef CONFIG_OF
+ 		.of_match_table = xgbe_of_match,
++#endif
+ 		.pm = &xgbe_pm_ops,
+ 	},
+ 	.probe = xgbe_probe,
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+index 363b210..5d2c89b 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+@@ -119,6 +119,7 @@
+ #include <linux/mdio.h>
+ #include <linux/phy.h>
+ #include <linux/of.h>
++#include <linux/acpi.h>
+ 
+ #include "xgbe.h"
+ #include "xgbe-common.h"
+@@ -205,25 +206,16 @@ void xgbe_dump_phy_registers(struct xgbe_prv_data *pdata)
+ 
+ int xgbe_mdio_register(struct xgbe_prv_data *pdata)
+ {
+-	struct device_node *phy_node;
+ 	struct mii_bus *mii;
+ 	struct phy_device *phydev;
+ 	int ret = 0;
+ 
+ 	DBGPR("-->xgbe_mdio_register\n");
+ 
+-	/* Retrieve the phy-handle */
+-	phy_node = of_parse_phandle(pdata->dev->of_node, "phy-handle", 0);
+-	if (!phy_node) {
+-		dev_err(pdata->dev, "unable to parse phy-handle\n");
+-		return -EINVAL;
+-	}
+-
+ 	mii = mdiobus_alloc();
+ 	if (mii == NULL) {
+ 		dev_err(pdata->dev, "mdiobus_alloc failed\n");
+-		ret = -ENOMEM;
+-		goto err_node_get;
++		return -ENOMEM;
+ 	}
+ 
+ 	/* Register on the MDIO bus (don't probe any PHYs) */
+@@ -252,12 +244,9 @@ int xgbe_mdio_register(struct xgbe_prv_data *pdata)
+ 	request_module(MDIO_MODULE_PREFIX MDIO_ID_FMT,
+ 		       MDIO_ID_ARGS(phydev->c45_ids.device_ids[MDIO_MMD_PCS]));
+ 
+-	of_node_get(phy_node);
+-	phydev->dev.of_node = phy_node;
+ 	ret = phy_device_register(phydev);
+ 	if (ret) {
+ 		dev_err(pdata->dev, "phy_device_register failed\n");
+-		of_node_put(phy_node);
+ 		goto err_phy_device;
+ 	}
+ 
+@@ -283,8 +272,6 @@ int xgbe_mdio_register(struct xgbe_prv_data *pdata)
+ 
+ 	pdata->phydev = phydev;
+ 
+-	of_node_put(phy_node);
+-
+ 	DBGPHY_REGS(pdata);
+ 
+ 	DBGPR("<--xgbe_mdio_register\n");
+@@ -300,9 +287,6 @@ err_mdiobus_register:
+ err_mdiobus_alloc:
+ 	mdiobus_free(mii);
+ 
+-err_node_get:
+-	of_node_put(phy_node);
+-
+ 	return ret;
+ }
+ 
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-ptp.c b/drivers/net/ethernet/amd/xgbe/xgbe-ptp.c
+index a1bf9d1c..fa67203 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-ptp.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-ptp.c
+@@ -239,7 +239,7 @@ void xgbe_ptp_register(struct xgbe_prv_data *pdata)
+ 	snprintf(info->name, sizeof(info->name), "%s",
+ 		 netdev_name(pdata->netdev));
+ 	info->owner = THIS_MODULE;
+-	info->max_adj = clk_get_rate(pdata->ptpclk);
++	info->max_adj = pdata->ptpclk_rate;
+ 	info->adjfreq = xgbe_adjfreq;
+ 	info->adjtime = xgbe_adjtime;
+ 	info->gettime = xgbe_gettime;
+@@ -260,7 +260,7 @@ void xgbe_ptp_register(struct xgbe_prv_data *pdata)
+ 	 */
+ 	dividend = 50000000;
+ 	dividend <<= 32;
+-	pdata->tstamp_addend = div_u64(dividend, clk_get_rate(pdata->ptpclk));
++	pdata->tstamp_addend = div_u64(dividend, pdata->ptpclk_rate);
+ 
+ 	/* Setup the timecounter */
+ 	cc->read = xgbe_cc_read;
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index f9ec762..6f3a39e 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -187,6 +187,12 @@
+ #define XGBE_PTP_CLOCK		"ptp_clk"
+ #define XGBE_DMA_IRQS		"amd,per-channel-interrupt"
+ 
++/* ACPI property names */
++#define XGBE_ACPI_MAC_ADDR	"mac-address"
++#define XGBE_ACPI_PHY_MODE	"phy-mode"
++#define XGBE_ACPI_DMA_FREQ	"amd,dma-freq"
++#define XGBE_ACPI_PTP_FREQ	"amd,ptp-freq"
++
+ /* Timestamp support - values based on 50MHz PTP clock
+  *   50MHz => 20 nsec
+  */
+@@ -201,8 +207,11 @@
+ #define XGBE_FIFO_SIZE_B(x)	(x)
+ #define XGBE_FIFO_SIZE_KB(x)	(x * 1024)
+ 
++#define XGBE_TC_CNT		2
+ #define XGBE_TC_MIN_QUANTUM	10
+ 
++#define XGBE_SEATTLE_A0		((read_cpuid_id() & 0x00f0000f) == 0)
++
+ /* Helper macro for descriptor handling
+  *  Always use XGBE_GET_DESC_DATA to access the descriptor data
+  *  since the index is free-running and needs to be and-ed
+@@ -650,6 +659,7 @@ struct xgbe_hw_features {
+ struct xgbe_prv_data {
+ 	struct net_device *netdev;
+ 	struct platform_device *pdev;
++	struct acpi_device *adev;
+ 	struct device *dev;
+ 
+ 	/* XGMAC/XPCS related mmio registers */
+@@ -739,6 +749,7 @@ struct xgbe_prv_data {
+ 	unsigned int phy_rx_pause;
+ 
+ 	/* Netdev related settings */
++	unsigned char mac_addr[MAX_ADDR_LEN];
+ 	netdev_features_t netdev_features;
+ 	struct napi_struct napi;
+ 	struct xgbe_mmc_stats mmc_stats;
+@@ -748,7 +759,9 @@ struct xgbe_prv_data {
+ 
+ 	/* Device clocks */
+ 	struct clk *sysclk;
++	unsigned long sysclk_rate;
+ 	struct clk *ptpclk;
++	unsigned long ptpclk_rate;
+ 
+ 	/* Timestamp support */
+ 	spinlock_t tstamp_lock;
+diff --git a/drivers/net/phy/amd-xgbe-phy.c b/drivers/net/phy/amd-xgbe-phy.c
+index 903dc3d..fcc4fc7 100644
+--- a/drivers/net/phy/amd-xgbe-phy.c
++++ b/drivers/net/phy/amd-xgbe-phy.c
+@@ -74,15 +74,19 @@
+ #include <linux/of_platform.h>
+ #include <linux/of_device.h>
+ #include <linux/uaccess.h>
++#include <linux/acpi.h>
++
+ 
+ MODULE_AUTHOR("Tom Lendacky <thomas.lendacky@amd.com>");
+ MODULE_LICENSE("Dual BSD/GPL");
+-MODULE_VERSION("1.0.0-a");
++MODULE_VERSION("0.0.0-a");
+ MODULE_DESCRIPTION("AMD 10GbE (amd-xgbe) PHY driver");
+ 
+-#define XGBE_PHY_ID	0x000162d0
++#define XGBE_PHY_ID	0x7996ced0
+ #define XGBE_PHY_MASK	0xfffffff0
+ 
++#define XGBE_PHY_SERDES_RETRY		32
++#define XGBE_PHY_CHANNEL_PROPERTY	"amd,serdes-channel"
+ #define XGBE_PHY_SPEEDSET_PROPERTY	"amd,speed-set"
+ 
+ #define XGBE_AN_INT_CMPLT		0x01
+@@ -99,11 +103,9 @@ MODULE_DESCRIPTION("AMD 10GbE (amd-xgbe) PHY driver");
+ #ifndef MDIO_PMA_10GBR_PMD_CTRL
+ #define MDIO_PMA_10GBR_PMD_CTRL		0x0096
+ #endif
+-
+ #ifndef MDIO_PMA_10GBR_FEC_CTRL
+ #define MDIO_PMA_10GBR_FEC_CTRL		0x00ab
+ #endif
+-
+ #ifndef MDIO_AN_XNP
+ #define MDIO_AN_XNP			0x0016
+ #endif
+@@ -111,93 +113,14 @@ MODULE_DESCRIPTION("AMD 10GbE (amd-xgbe) PHY driver");
+ #ifndef MDIO_AN_INTMASK
+ #define MDIO_AN_INTMASK			0x8001
+ #endif
+-
+ #ifndef MDIO_AN_INT
+ #define MDIO_AN_INT			0x8002
+ #endif
+ 
+-#ifndef MDIO_AN_KR_CTRL
+-#define MDIO_AN_KR_CTRL			0x8003
+-#endif
+-
+ #ifndef MDIO_CTRL1_SPEED1G
+ #define MDIO_CTRL1_SPEED1G		(MDIO_CTRL1_SPEED10G & ~BMCR_SPEED100)
+ #endif
+ 
+-#ifndef MDIO_KR_CTRL_PDETECT
+-#define MDIO_KR_CTRL_PDETECT		0x01
+-#endif
+-
+-/* SerDes integration register offsets */
+-#define SIR0_KR_RT_1			0x002c
+-#define SIR0_STATUS			0x0040
+-#define SIR1_SPEED			0x0000
+-
+-/* SerDes integration register entry bit positions and sizes */
+-#define SIR0_KR_RT_1_RESET_INDEX	11
+-#define SIR0_KR_RT_1_RESET_WIDTH	1
+-#define SIR0_STATUS_RX_READY_INDEX	0
+-#define SIR0_STATUS_RX_READY_WIDTH	1
+-#define SIR0_STATUS_TX_READY_INDEX	8
+-#define SIR0_STATUS_TX_READY_WIDTH	1
+-#define SIR1_SPEED_DATARATE_INDEX	4
+-#define SIR1_SPEED_DATARATE_WIDTH	2
+-#define SIR1_SPEED_PI_SPD_SEL_INDEX	12
+-#define SIR1_SPEED_PI_SPD_SEL_WIDTH	4
+-#define SIR1_SPEED_PLLSEL_INDEX		3
+-#define SIR1_SPEED_PLLSEL_WIDTH		1
+-#define SIR1_SPEED_RATECHANGE_INDEX	6
+-#define SIR1_SPEED_RATECHANGE_WIDTH	1
+-#define SIR1_SPEED_TXAMP_INDEX		8
+-#define SIR1_SPEED_TXAMP_WIDTH		4
+-#define SIR1_SPEED_WORDMODE_INDEX	0
+-#define SIR1_SPEED_WORDMODE_WIDTH	3
+-
+-#define SPEED_10000_CDR			0x7
+-#define SPEED_10000_PLL			0x1
+-#define SPEED_10000_RATE		0x0
+-#define SPEED_10000_TXAMP		0xa
+-#define SPEED_10000_WORD		0x7
+-
+-#define SPEED_2500_CDR			0x2
+-#define SPEED_2500_PLL			0x0
+-#define SPEED_2500_RATE			0x1
+-#define SPEED_2500_TXAMP		0xf
+-#define SPEED_2500_WORD			0x1
+-
+-#define SPEED_1000_CDR			0x2
+-#define SPEED_1000_PLL			0x0
+-#define SPEED_1000_RATE			0x3
+-#define SPEED_1000_TXAMP		0xf
+-#define SPEED_1000_WORD			0x1
+-
+-/* SerDes RxTx register offsets */
+-#define RXTX_REG20			0x0050
+-#define RXTX_REG114			0x01c8
+-
+-/* SerDes RxTx register entry bit positions and sizes */
+-#define RXTX_REG20_BLWC_ENA_INDEX	2
+-#define RXTX_REG20_BLWC_ENA_WIDTH	1
+-#define RXTX_REG114_PQ_REG_INDEX	9
+-#define RXTX_REG114_PQ_REG_WIDTH	7
+-
+-#define RXTX_10000_BLWC			0
+-#define RXTX_10000_PQ			0x1e
+-
+-#define RXTX_2500_BLWC			1
+-#define RXTX_2500_PQ			0xa
+-
+-#define RXTX_1000_BLWC			1
+-#define RXTX_1000_PQ			0xa
+-
+-/* Bit setting and getting macros
+- *  The get macro will extract the current bit field value from within
+- *  the variable
+- *
+- *  The set macro will clear the current bit field value within the
+- *  variable and then set the bit field of the variable to the
+- *  specified value
+- */
+ #define GET_BITS(_var, _index, _width)					\
+ 	(((_var) >> (_index)) & ((0x1 << (_width)) - 1))
+ 
+@@ -207,70 +130,12 @@ do {									\
+ 	(_var) |= (((_val) & ((0x1 << (_width)) - 1)) << (_index));	\
+ } while (0)
+ 
+-#define XSIR_GET_BITS(_var, _prefix, _field)				\
+-	GET_BITS((_var),						\
+-		 _prefix##_##_field##_INDEX,				\
+-		 _prefix##_##_field##_WIDTH)
+-
+-#define XSIR_SET_BITS(_var, _prefix, _field, _val)			\
+-	SET_BITS((_var),						\
+-		 _prefix##_##_field##_INDEX,				\
+-		 _prefix##_##_field##_WIDTH, (_val))
+-
+-/* Macros for reading or writing SerDes integration registers
+- *  The ioread macros will get bit fields or full values using the
+- *  register definitions formed using the input names
+- *
+- *  The iowrite macros will set bit fields or full values using the
+- *  register definitions formed using the input names
+- */
+-#define XSIR0_IOREAD(_priv, _reg)					\
+-	ioread16((_priv)->sir0_regs + _reg)
+-
+-#define XSIR0_IOREAD_BITS(_priv, _reg, _field)				\
+-	GET_BITS(XSIR0_IOREAD((_priv), _reg),				\
+-		 _reg##_##_field##_INDEX,				\
+-		 _reg##_##_field##_WIDTH)
+-
+-#define XSIR0_IOWRITE(_priv, _reg, _val)				\
+-	iowrite16((_val), (_priv)->sir0_regs + _reg)
+-
+-#define XSIR0_IOWRITE_BITS(_priv, _reg, _field, _val)			\
+-do {									\
+-	u16 reg_val = XSIR0_IOREAD((_priv), _reg);			\
+-	SET_BITS(reg_val,						\
+-		 _reg##_##_field##_INDEX,				\
+-		 _reg##_##_field##_WIDTH, (_val));			\
+-	XSIR0_IOWRITE((_priv), _reg, reg_val);				\
+-} while (0)
+-
+-#define XSIR1_IOREAD(_priv, _reg)					\
+-	ioread16((_priv)->sir1_regs + _reg)
+-
+-#define XSIR1_IOREAD_BITS(_priv, _reg, _field)				\
+-	GET_BITS(XSIR1_IOREAD((_priv), _reg),				\
+-		 _reg##_##_field##_INDEX,				\
+-		 _reg##_##_field##_WIDTH)
++#define XCMU_IOREAD(_priv, _reg)					\
++	ioread16((_priv)->cmu_regs + _reg)
+ 
+-#define XSIR1_IOWRITE(_priv, _reg, _val)				\
+-	iowrite16((_val), (_priv)->sir1_regs + _reg)
++#define XCMU_IOWRITE(_priv, _reg, _val)					\
++	iowrite16((_val), (_priv)->cmu_regs + _reg)
+ 
+-#define XSIR1_IOWRITE_BITS(_priv, _reg, _field, _val)			\
+-do {									\
+-	u16 reg_val = XSIR1_IOREAD((_priv), _reg);			\
+-	SET_BITS(reg_val,						\
+-		 _reg##_##_field##_INDEX,				\
+-		 _reg##_##_field##_WIDTH, (_val));			\
+-	XSIR1_IOWRITE((_priv), _reg, reg_val);				\
+-} while (0)
+-
+-/* Macros for reading or writing SerDes RxTx registers
+- *  The ioread macros will get bit fields or full values using the
+- *  register definitions formed using the input names
+- *
+- *  The iowrite macros will set bit fields or full values using the
+- *  register definitions formed using the input names
+- */
+ #define XRXTX_IOREAD(_priv, _reg)					\
+ 	ioread16((_priv)->rxtx_regs + _reg)
+ 
+@@ -291,6 +156,78 @@ do {									\
+ 	XRXTX_IOWRITE((_priv), _reg, reg_val);				\
+ } while (0)
+ 
++/* SerDes CMU register offsets */
++#define CMU_REG15			0x003c
++#define CMU_REG16			0x0040
++
++/* SerDes CMU register entry bit positions and sizes */
++#define CMU_REG16_TX_RATE_CHANGE_BASE	15
++#define CMU_REG16_RX_RATE_CHANGE_BASE	14
++#define CMU_REG16_RATE_CHANGE_DECR	2
++
++
++/* SerDes RxTx register offsets */
++#define RXTX_REG2			0x0008
++#define RXTX_REG3			0x000c
++#define RXTX_REG5			0x0014
++#define RXTX_REG6			0x0018
++#define RXTX_REG20			0x0050
++#define RXTX_REG53			0x00d4
++#define RXTX_REG114			0x01c8
++#define RXTX_REG115			0x01cc
++#define RXTX_REG142			0x0238
++
++/* SerDes RxTx register entry bit positions and sizes */
++#define RXTX_REG2_RESETB_INDEX			15
++#define RXTX_REG2_RESETB_WIDTH			1
++#define RXTX_REG3_TX_DATA_RATE_INDEX		14
++#define RXTX_REG3_TX_DATA_RATE_WIDTH		2
++#define RXTX_REG3_TX_WORD_MODE_INDEX		11
++#define RXTX_REG3_TX_WORD_MODE_WIDTH		3
++#define RXTX_REG5_TXAMP_CNTL_INDEX		7
++#define RXTX_REG5_TXAMP_CNTL_WIDTH		4
++#define RXTX_REG6_RX_DATA_RATE_INDEX		9
++#define RXTX_REG6_RX_DATA_RATE_WIDTH		2
++#define RXTX_REG6_RX_WORD_MODE_INDEX		11
++#define RXTX_REG6_RX_WORD_MODE_WIDTH		3
++#define RXTX_REG20_BLWC_ENA_INDEX		2
++#define RXTX_REG20_BLWC_ENA_WIDTH		1
++#define RXTX_REG53_RX_PLLSELECT_INDEX		15
++#define RXTX_REG53_RX_PLLSELECT_WIDTH		1
++#define RXTX_REG53_TX_PLLSELECT_INDEX		14
++#define RXTX_REG53_TX_PLLSELECT_WIDTH		1
++#define RXTX_REG53_PI_SPD_SEL_CDR_INDEX		10
++#define RXTX_REG53_PI_SPD_SEL_CDR_WIDTH		4
++#define RXTX_REG114_PQ_REG_INDEX		9
++#define RXTX_REG114_PQ_REG_WIDTH		7
++#define RXTX_REG115_FORCE_LAT_CAL_START_INDEX	2
++#define RXTX_REG115_FORCE_LAT_CAL_START_WIDTH	1
++#define RXTX_REG115_FORCE_SUM_CAL_START_INDEX	1
++#define RXTX_REG115_FORCE_SUM_CAL_START_WIDTH	1
++#define RXTX_REG142_SUM_CALIB_DONE_INDEX	15
++#define RXTX_REG142_SUM_CALIB_DONE_WIDTH	1
++#define RXTX_REG142_SUM_CALIB_ERR_INDEX		14
++#define RXTX_REG142_SUM_CALIB_ERR_WIDTH		1
++#define RXTX_REG142_LAT_CALIB_DONE_INDEX	11
++#define RXTX_REG142_LAT_CALIB_DONE_WIDTH	1
++
++#define RXTX_FULL_RATE				0x0
++#define RXTX_HALF_RATE				0x1
++#define RXTX_FIFTH_RATE				0x3
++#define RXTX_66BIT_WORD				0x7
++#define RXTX_10BIT_WORD				0x1
++#define RXTX_10G_TX_AMP				0xa
++#define RXTX_1G_TX_AMP				0xf
++#define RXTX_10G_CDR				0x7
++#define RXTX_1G_CDR				0x2
++#define RXTX_10G_PLL				0x1
++#define RXTX_1G_PLL				0x0
++#define RXTX_10G_PQ				0x1e
++#define RXTX_1G_PQ				0xa
++
++
++DEFINE_SPINLOCK(cmu_lock);
++
+ enum amd_xgbe_phy_an {
+ 	AMD_XGBE_AN_READY = 0,
+ 	AMD_XGBE_AN_START,
+@@ -316,29 +253,31 @@ enum amd_xgbe_phy_mode {
+ };
+ 
+ enum amd_xgbe_phy_speedset {
+-	AMD_XGBE_PHY_SPEEDSET_1000_10000,
++	AMD_XGBE_PHY_SPEEDSET_1000_10000 = 0,
+ 	AMD_XGBE_PHY_SPEEDSET_2500_10000,
+ };
+ 
+ struct amd_xgbe_phy_priv {
+ 	struct platform_device *pdev;
++	struct acpi_device *adev;
+ 	struct device *dev;
+ 
+ 	struct phy_device *phydev;
+ 
+ 	/* SerDes related mmio resources */
+ 	struct resource *rxtx_res;
+-	struct resource *sir0_res;
+-	struct resource *sir1_res;
++	struct resource *cmu_res;
+ 
+ 	/* SerDes related mmio registers */
+ 	void __iomem *rxtx_regs;	/* SerDes Rx/Tx CSRs */
+-	void __iomem *sir0_regs;	/* SerDes integration registers (1/2) */
+-	void __iomem *sir1_regs;	/* SerDes integration registers (2/2) */
++	void __iomem *cmu_regs;		/* SerDes CMU CSRs */
++
++	unsigned int serdes_channel;
++	unsigned int speed_set;
+ 
+ 	/* Maintain link status for re-starting auto-negotiation */
+ 	unsigned int link;
+-	unsigned int speed_set;
++	enum amd_xgbe_phy_mode mode;
+ 
+ 	/* Auto-negotiation state machine support */
+ 	struct mutex an_mutex;
+@@ -348,7 +287,6 @@ struct amd_xgbe_phy_priv {
+ 	enum amd_xgbe_phy_rx kx_state;
+ 	struct work_struct an_work;
+ 	struct workqueue_struct *an_workqueue;
+-	unsigned int parallel_detect;
+ };
+ 
+ static int amd_xgbe_an_enable_kr_training(struct phy_device *phydev)
+@@ -401,33 +339,51 @@ static int amd_xgbe_phy_pcs_power_cycle(struct phy_device *phydev)
+ static void amd_xgbe_phy_serdes_start_ratechange(struct phy_device *phydev)
+ {
+ 	struct amd_xgbe_phy_priv *priv = phydev->priv;
++	u16 val, mask;
++
++	/* Assert Rx and Tx ratechange in CMU_reg16 */
++	val = XCMU_IOREAD(priv, CMU_REG16);
+ 
+-	/* Assert Rx and Tx ratechange */
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, RATECHANGE, 1);
++	mask = (1 << (CMU_REG16_TX_RATE_CHANGE_BASE -
++		      (priv->serdes_channel * CMU_REG16_RATE_CHANGE_DECR))) |
++	       (1 << (CMU_REG16_RX_RATE_CHANGE_BASE -
++		      (priv->serdes_channel * CMU_REG16_RATE_CHANGE_DECR)));
++	val |= mask;
++
++	XCMU_IOWRITE(priv, CMU_REG16, val);
+ }
+ 
+ static void amd_xgbe_phy_serdes_complete_ratechange(struct phy_device *phydev)
+ {
+ 	struct amd_xgbe_phy_priv *priv = phydev->priv;
++	u16 val, mask;
+ 	unsigned int wait;
+-	u16 status;
+ 
+-	/* Release Rx and Tx ratechange */
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, RATECHANGE, 0);
++	/* Release Rx and Tx ratechange for proper channel in CMU_reg16 */
++	val = XCMU_IOREAD(priv, CMU_REG16);
++
++	mask = (1 << (CMU_REG16_TX_RATE_CHANGE_BASE -
++		      (priv->serdes_channel * CMU_REG16_RATE_CHANGE_DECR))) |
++	       (1 << (CMU_REG16_RX_RATE_CHANGE_BASE -
++		      (priv->serdes_channel * CMU_REG16_RATE_CHANGE_DECR)));
++	val &= ~mask;
+ 
+-	/* Wait for Rx and Tx ready */
++	XCMU_IOWRITE(priv, CMU_REG16, val);
++
++	/* Wait for Rx and Tx ready in CMU_reg15 */
++	mask = (1 << priv->serdes_channel) |
++	       (1 << (priv->serdes_channel + 8));
+ 	wait = XGBE_PHY_RATECHANGE_COUNT;
+ 	while (wait--) {
+-		usleep_range(50, 75);
++		udelay(50);
+ 
+-		status = XSIR0_IOREAD(priv, SIR0_STATUS);
+-		if (XSIR_GET_BITS(status, SIR0_STATUS, RX_READY) &&
+-		    XSIR_GET_BITS(status, SIR0_STATUS, TX_READY))
++		val = XCMU_IOREAD(priv, CMU_REG15);
++		if ((val & mask) == mask)
+ 			return;
+ 	}
+ 
+ 	netdev_dbg(phydev->attached_dev, "SerDes rx/tx not ready (%#hx)\n",
+-		   status);
++		   val);
+ }
+ 
+ static int amd_xgbe_phy_xgmii_mode(struct phy_device *phydev)
+@@ -435,8 +391,8 @@ static int amd_xgbe_phy_xgmii_mode(struct phy_device *phydev)
+ 	struct amd_xgbe_phy_priv *priv = phydev->priv;
+ 	int ret;
+ 
+-	/* Enable KR training */
+-	ret = amd_xgbe_an_enable_kr_training(phydev);
++	/* Disable KR training */
++	ret = amd_xgbe_an_disable_kr_training(phydev);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -462,19 +418,32 @@ static int amd_xgbe_phy_xgmii_mode(struct phy_device *phydev)
+ 		return ret;
+ 
+ 	/* Set SerDes to 10G speed */
++	spin_lock(&cmu_lock);
++
+ 	amd_xgbe_phy_serdes_start_ratechange(phydev);
+ 
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, DATARATE, SPEED_10000_RATE);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, WORDMODE, SPEED_10000_WORD);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, TXAMP, SPEED_10000_TXAMP);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, PLLSEL, SPEED_10000_PLL);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, PI_SPD_SEL, SPEED_10000_CDR);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG3, TX_DATA_RATE, RXTX_FULL_RATE);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG3, TX_WORD_MODE, RXTX_66BIT_WORD);
+ 
+-	XRXTX_IOWRITE_BITS(priv, RXTX_REG20, BLWC_ENA, RXTX_10000_BLWC);
+-	XRXTX_IOWRITE_BITS(priv, RXTX_REG114, PQ_REG, RXTX_10000_PQ);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG5, TXAMP_CNTL, RXTX_10G_TX_AMP);
++
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG6, RX_DATA_RATE, RXTX_FULL_RATE);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG6, RX_WORD_MODE, RXTX_66BIT_WORD);
++
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG20, BLWC_ENA, 0);
++
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG53, RX_PLLSELECT, RXTX_10G_PLL);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG53, TX_PLLSELECT, RXTX_10G_PLL);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG53, PI_SPD_SEL_CDR, RXTX_10G_CDR);
++
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG114, PQ_REG, RXTX_10G_PQ);
+ 
+ 	amd_xgbe_phy_serdes_complete_ratechange(phydev);
+ 
++	spin_unlock(&cmu_lock);
++
++	priv->mode = AMD_XGBE_MODE_KR;
++
+ 	return 0;
+ }
+ 
+@@ -510,19 +479,32 @@ static int amd_xgbe_phy_gmii_2500_mode(struct phy_device *phydev)
+ 		return ret;
+ 
+ 	/* Set SerDes to 2.5G speed */
++	spin_lock(&cmu_lock);
++
+ 	amd_xgbe_phy_serdes_start_ratechange(phydev);
+ 
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, DATARATE, SPEED_2500_RATE);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, WORDMODE, SPEED_2500_WORD);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, TXAMP, SPEED_2500_TXAMP);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, PLLSEL, SPEED_2500_PLL);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, PI_SPD_SEL, SPEED_2500_CDR);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG3, TX_DATA_RATE, RXTX_HALF_RATE);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG3, TX_WORD_MODE, RXTX_10BIT_WORD);
++
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG5, TXAMP_CNTL, RXTX_1G_TX_AMP);
++
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG6, RX_DATA_RATE, RXTX_HALF_RATE);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG6, RX_WORD_MODE, RXTX_10BIT_WORD);
+ 
+-	XRXTX_IOWRITE_BITS(priv, RXTX_REG20, BLWC_ENA, RXTX_2500_BLWC);
+-	XRXTX_IOWRITE_BITS(priv, RXTX_REG114, PQ_REG, RXTX_2500_PQ);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG20, BLWC_ENA, 1);
++
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG53, RX_PLLSELECT, RXTX_1G_PLL);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG53, TX_PLLSELECT, RXTX_1G_PLL);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG53, PI_SPD_SEL_CDR, RXTX_1G_CDR);
++
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG114, PQ_REG, RXTX_1G_PQ);
+ 
+ 	amd_xgbe_phy_serdes_complete_ratechange(phydev);
+ 
++	spin_unlock(&cmu_lock);
++
++	priv->mode = AMD_XGBE_MODE_KX;
++
+ 	return 0;
+ }
+ 
+@@ -558,47 +540,33 @@ static int amd_xgbe_phy_gmii_mode(struct phy_device *phydev)
+ 		return ret;
+ 
+ 	/* Set SerDes to 1G speed */
++	spin_lock(&cmu_lock);
++
+ 	amd_xgbe_phy_serdes_start_ratechange(phydev);
+ 
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, DATARATE, SPEED_1000_RATE);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, WORDMODE, SPEED_1000_WORD);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, TXAMP, SPEED_1000_TXAMP);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, PLLSEL, SPEED_1000_PLL);
+-	XSIR1_IOWRITE_BITS(priv, SIR1_SPEED, PI_SPD_SEL, SPEED_1000_CDR);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG3, TX_DATA_RATE, RXTX_FIFTH_RATE);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG3, TX_WORD_MODE, RXTX_10BIT_WORD);
+ 
+-	XRXTX_IOWRITE_BITS(priv, RXTX_REG20, BLWC_ENA, RXTX_1000_BLWC);
+-	XRXTX_IOWRITE_BITS(priv, RXTX_REG114, PQ_REG, RXTX_1000_PQ);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG5, TXAMP_CNTL, RXTX_1G_TX_AMP);
+ 
+-	amd_xgbe_phy_serdes_complete_ratechange(phydev);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG6, RX_DATA_RATE, RXTX_FIFTH_RATE);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG6, RX_WORD_MODE, RXTX_10BIT_WORD);
+ 
+-	return 0;
+-}
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG20, BLWC_ENA, 1);
+ 
+-static int amd_xgbe_phy_cur_mode(struct phy_device *phydev,
+-				 enum amd_xgbe_phy_mode *mode)
+-{
+-	int ret;
+-
+-	ret = phy_read_mmd(phydev, MDIO_MMD_PCS, MDIO_CTRL2);
+-	if (ret < 0)
+-		return ret;
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG53, RX_PLLSELECT, RXTX_1G_PLL);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG53, TX_PLLSELECT, RXTX_1G_PLL);
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG53, PI_SPD_SEL_CDR, RXTX_1G_CDR);
+ 
+-	if ((ret & MDIO_PCS_CTRL2_TYPE) == MDIO_PCS_CTRL2_10GBR)
+-		*mode = AMD_XGBE_MODE_KR;
+-	else
+-		*mode = AMD_XGBE_MODE_KX;
++	XRXTX_IOWRITE_BITS(priv, RXTX_REG114, PQ_REG, RXTX_1G_PQ);
+ 
+-	return 0;
+-}
++	amd_xgbe_phy_serdes_complete_ratechange(phydev);
+ 
+-static bool amd_xgbe_phy_in_kr_mode(struct phy_device *phydev)
+-{
+-	enum amd_xgbe_phy_mode mode;
++	spin_unlock(&cmu_lock);
+ 
+-	if (amd_xgbe_phy_cur_mode(phydev, &mode))
+-		return false;
++	priv->mode = AMD_XGBE_MODE_KX;
+ 
+-	return (mode == AMD_XGBE_MODE_KR);
++	return 0;
+ }
+ 
+ static int amd_xgbe_phy_switch_mode(struct phy_device *phydev)
+@@ -607,7 +575,7 @@ static int amd_xgbe_phy_switch_mode(struct phy_device *phydev)
+ 	int ret;
+ 
+ 	/* If we are in KR switch to KX, and vice-versa */
+-	if (amd_xgbe_phy_in_kr_mode(phydev)) {
++	if (priv->mode == AMD_XGBE_MODE_KR) {
+ 		if (priv->speed_set == AMD_XGBE_PHY_SPEEDSET_1000_10000)
+ 			ret = amd_xgbe_phy_gmii_mode(phydev);
+ 		else
+@@ -619,20 +587,15 @@ static int amd_xgbe_phy_switch_mode(struct phy_device *phydev)
+ 	return ret;
+ }
+ 
+-static int amd_xgbe_phy_set_mode(struct phy_device *phydev,
+-				 enum amd_xgbe_phy_mode mode)
++static enum amd_xgbe_phy_an amd_xgbe_an_switch_mode(struct phy_device *phydev)
+ {
+-	enum amd_xgbe_phy_mode cur_mode;
+ 	int ret;
+ 
+-	ret = amd_xgbe_phy_cur_mode(phydev, &cur_mode);
+-	if (ret)
+-		return ret;
+-
+-	if (mode != cur_mode)
+-		ret = amd_xgbe_phy_switch_mode(phydev);
++	ret = amd_xgbe_phy_switch_mode(phydev);
++	if (ret < 0)
++		return AMD_XGBE_AN_ERROR;
+ 
+-	return ret;
++	return AMD_XGBE_AN_START;
+ }
+ 
+ static enum amd_xgbe_phy_an amd_xgbe_an_tx_training(struct phy_device *phydev,
+@@ -643,8 +606,8 @@ static enum amd_xgbe_phy_an amd_xgbe_an_tx_training(struct phy_device *phydev,
+ 
+ 	*state = AMD_XGBE_RX_COMPLETE;
+ 
+-	/* If we're not in KR mode then we're done */
+-	if (!amd_xgbe_phy_in_kr_mode(phydev))
++	/* If we're in KX mode then we're done */
++	if (priv->mode == AMD_XGBE_MODE_KX)
+ 		return AMD_XGBE_AN_EVENT;
+ 
+ 	/* Enable/Disable FEC */
+@@ -672,13 +635,9 @@ static enum amd_xgbe_phy_an amd_xgbe_an_tx_training(struct phy_device *phydev,
+ 	if (ret < 0)
+ 		return AMD_XGBE_AN_ERROR;
+ 
+-	XSIR0_IOWRITE_BITS(priv, SIR0_KR_RT_1, RESET, 1);
+-
+ 	ret |= 0x01;
+ 	phy_write_mmd(phydev, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_PMD_CTRL, ret);
+ 
+-	XSIR0_IOWRITE_BITS(priv, SIR0_KR_RT_1, RESET, 0);
+-
+ 	return AMD_XGBE_AN_EVENT;
+ }
+ 
+@@ -702,6 +661,7 @@ static enum amd_xgbe_phy_an amd_xgbe_an_tx_xnp(struct phy_device *phydev,
+ static enum amd_xgbe_phy_an amd_xgbe_an_rx_bpa(struct phy_device *phydev,
+ 					       enum amd_xgbe_phy_rx *state)
+ {
++	struct amd_xgbe_phy_priv *priv = phydev->priv;
+ 	unsigned int link_support;
+ 	int ret, ad_reg, lp_reg;
+ 
+@@ -711,9 +671,9 @@ static enum amd_xgbe_phy_an amd_xgbe_an_rx_bpa(struct phy_device *phydev,
+ 		return AMD_XGBE_AN_ERROR;
+ 
+ 	/* Check for a supported mode, otherwise restart in a different one */
+-	link_support = amd_xgbe_phy_in_kr_mode(phydev) ? 0x80 : 0x20;
++	link_support = (priv->mode == AMD_XGBE_MODE_KR) ? 0x80 : 0x20;
+ 	if (!(ret & link_support))
+-		return AMD_XGBE_AN_INCOMPAT_LINK;
++		return amd_xgbe_an_switch_mode(phydev);
+ 
+ 	/* Check Extended Next Page support */
+ 	ad_reg = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_ADVERTISE);
+@@ -754,7 +714,7 @@ static enum amd_xgbe_phy_an amd_xgbe_an_start(struct phy_device *phydev)
+ 	int ret;
+ 
+ 	/* Be sure we aren't looping trying to negotiate */
+-	if (amd_xgbe_phy_in_kr_mode(phydev)) {
++	if (priv->mode == AMD_XGBE_MODE_KR) {
+ 		if (priv->kr_state != AMD_XGBE_RX_READY)
+ 			return AMD_XGBE_AN_NO_LINK;
+ 		priv->kr_state = AMD_XGBE_RX_BPA;
+@@ -817,13 +777,6 @@ static enum amd_xgbe_phy_an amd_xgbe_an_start(struct phy_device *phydev)
+ 	/* Enable and start auto-negotiation */
+ 	phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_INT, 0);
+ 
+-	ret = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_KR_CTRL);
+-	if (ret < 0)
+-		return AMD_XGBE_AN_ERROR;
+-
+-	ret |= MDIO_KR_CTRL_PDETECT;
+-	phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_KR_CTRL, ret);
+-
+ 	ret = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_CTRL1);
+ 	if (ret < 0)
+ 		return AMD_XGBE_AN_ERROR;
+@@ -864,8 +817,8 @@ static enum amd_xgbe_phy_an amd_xgbe_an_page_received(struct phy_device *phydev)
+ 	enum amd_xgbe_phy_rx *state;
+ 	int ret;
+ 
+-	state = amd_xgbe_phy_in_kr_mode(phydev) ? &priv->kr_state
+-						: &priv->kx_state;
++	state = (priv->mode == AMD_XGBE_MODE_KR) ? &priv->kr_state
++						 : &priv->kx_state;
+ 
+ 	switch (*state) {
+ 	case AMD_XGBE_RX_BPA:
+@@ -885,13 +838,7 @@ static enum amd_xgbe_phy_an amd_xgbe_an_page_received(struct phy_device *phydev)
+ 
+ static enum amd_xgbe_phy_an amd_xgbe_an_incompat_link(struct phy_device *phydev)
+ {
+-	int ret;
+-
+-	ret = amd_xgbe_phy_switch_mode(phydev);
+-	if (ret)
+-		return AMD_XGBE_AN_ERROR;
+-
+-	return AMD_XGBE_AN_START;
++	return amd_xgbe_an_switch_mode(phydev);
+ }
+ 
+ static void amd_xgbe_an_state_machine(struct work_struct *work)
+@@ -904,10 +851,6 @@ static void amd_xgbe_an_state_machine(struct work_struct *work)
+ 	int sleep;
+ 	unsigned int an_supported = 0;
+ 
+-	/* Start in KX mode */
+-	if (amd_xgbe_phy_set_mode(phydev, AMD_XGBE_MODE_KX))
+-		priv->an_state = AMD_XGBE_AN_ERROR;
+-
+ 	while (1) {
+ 		mutex_lock(&priv->an_mutex);
+ 
+@@ -915,9 +858,8 @@ static void amd_xgbe_an_state_machine(struct work_struct *work)
+ 
+ 		switch (priv->an_state) {
+ 		case AMD_XGBE_AN_START:
+-			an_supported = 0;
+-			priv->parallel_detect = 0;
+ 			priv->an_state = amd_xgbe_an_start(phydev);
++			an_supported = 0;
+ 			break;
+ 
+ 		case AMD_XGBE_AN_EVENT:
+@@ -934,7 +876,6 @@ static void amd_xgbe_an_state_machine(struct work_struct *work)
+ 			break;
+ 
+ 		case AMD_XGBE_AN_COMPLETE:
+-			priv->parallel_detect = an_supported ? 0 : 1;
+ 			netdev_info(phydev->attached_dev, "%s successful\n",
+ 				    an_supported ? "Auto negotiation"
+ 						 : "Parallel detection");
+@@ -1070,6 +1011,7 @@ static int amd_xgbe_phy_config_aneg(struct phy_device *phydev)
+ {
+ 	struct amd_xgbe_phy_priv *priv = phydev->priv;
+ 	u32 mmd_mask = phydev->c45_ids.devices_in_package;
++	int ret;
+ 
+ 	if (phydev->autoneg != AUTONEG_ENABLE)
+ 		return amd_xgbe_phy_setup_forced(phydev);
+@@ -1078,6 +1020,11 @@ static int amd_xgbe_phy_config_aneg(struct phy_device *phydev)
+ 	if (!(mmd_mask & MDIO_DEVS_AN))
+ 		return -EINVAL;
+ 
++	/* Get the current speed mode */
++	ret = phy_read_mmd(phydev, MDIO_MMD_PCS, MDIO_CTRL2);
++	if (ret < 0)
++		return ret;
++
+ 	/* Start/Restart the auto-negotiation state machine */
+ 	mutex_lock(&priv->an_mutex);
+ 	priv->an_result = AMD_XGBE_AN_READY;
+@@ -1167,14 +1114,18 @@ static int amd_xgbe_phy_read_status(struct phy_device *phydev)
+ {
+ 	struct amd_xgbe_phy_priv *priv = phydev->priv;
+ 	u32 mmd_mask = phydev->c45_ids.devices_in_package;
+-	int ret, ad_ret, lp_ret;
++	int ret, mode, ad_ret, lp_ret;
+ 
+ 	ret = amd_xgbe_phy_update_link(phydev);
+ 	if (ret)
+ 		return ret;
+ 
+-	if ((phydev->autoneg == AUTONEG_ENABLE) &&
+-	    !priv->parallel_detect) {
++	mode = phy_read_mmd(phydev, MDIO_MMD_PCS, MDIO_CTRL2);
++	if (mode < 0)
++		return mode;
++	mode &= MDIO_PCS_CTRL2_TYPE;
++
++	if (phydev->autoneg == AUTONEG_ENABLE) {
+ 		if (!(mmd_mask & MDIO_DEVS_AN))
+ 			return -EINVAL;
+ 
+@@ -1205,39 +1156,40 @@ static int amd_xgbe_phy_read_status(struct phy_device *phydev)
+ 		ad_ret &= lp_ret;
+ 		if (ad_ret & 0x80) {
+ 			phydev->speed = SPEED_10000;
+-			ret = amd_xgbe_phy_set_mode(phydev, AMD_XGBE_MODE_KR);
+-			if (ret)
+-				return ret;
++			if (mode != MDIO_PCS_CTRL2_10GBR) {
++				ret = amd_xgbe_phy_xgmii_mode(phydev);
++				if (ret < 0)
++					return ret;
++			}
+ 		} else {
+-			switch (priv->speed_set) {
+-			case AMD_XGBE_PHY_SPEEDSET_1000_10000:
+-				phydev->speed = SPEED_1000;
+-				break;
++			int (*mode_fcn)(struct phy_device *);
+ 
+-			case AMD_XGBE_PHY_SPEEDSET_2500_10000:
++			if (priv->speed_set ==
++			    AMD_XGBE_PHY_SPEEDSET_1000_10000) {
++				phydev->speed = SPEED_1000;
++				mode_fcn = amd_xgbe_phy_gmii_mode;
++			} else {
+ 				phydev->speed = SPEED_2500;
+-				break;
++				mode_fcn = amd_xgbe_phy_gmii_2500_mode;
+ 			}
+ 
+-			ret = amd_xgbe_phy_set_mode(phydev, AMD_XGBE_MODE_KX);
+-			if (ret)
+-				return ret;
++			if (mode == MDIO_PCS_CTRL2_10GBR) {
++				ret = mode_fcn(phydev);
++				if (ret < 0)
++					return ret;
++			}
+ 		}
+ 
+ 		phydev->duplex = DUPLEX_FULL;
+ 	} else {
+-		if (amd_xgbe_phy_in_kr_mode(phydev)) {
++		if (mode == MDIO_PCS_CTRL2_10GBR) {
+ 			phydev->speed = SPEED_10000;
+ 		} else {
+-			switch (priv->speed_set) {
+-			case AMD_XGBE_PHY_SPEEDSET_1000_10000:
++			if (priv->speed_set ==
++			    AMD_XGBE_PHY_SPEEDSET_1000_10000)
+ 				phydev->speed = SPEED_1000;
+-				break;
+-
+-			case AMD_XGBE_PHY_SPEEDSET_2500_10000:
++			else
+ 				phydev->speed = SPEED_2500;
+-				break;
+-			}
+ 		}
+ 		phydev->duplex = DUPLEX_FULL;
+ 		phydev->pause = 0;
+@@ -1289,29 +1241,188 @@ unlock:
+ 	return ret;
+ }
+ 
++static int amd_xgbe_phy_map_resources(struct amd_xgbe_phy_priv *priv,
++				      struct platform_device *phy_pdev,
++				      unsigned int phy_resnum)
++{
++	struct device *dev = priv->dev;
++	int ret;
++
++	/* Get the device mmio areas */
++	priv->rxtx_res = platform_get_resource(phy_pdev, IORESOURCE_MEM,
++					       phy_resnum++);
++	priv->rxtx_regs = devm_ioremap_resource(dev, priv->rxtx_res);
++	if (IS_ERR(priv->rxtx_regs)) {
++		dev_err(dev, "rxtx ioremap failed\n");
++		return PTR_ERR(priv->rxtx_regs);
++	}
++
++	/* All xgbe phy devices share the CMU registers so retrieve
++	 * the resource and do the ioremap directly rather than
++	 * the devm_ioremap_resource call
++	 */
++	priv->cmu_res = platform_get_resource(phy_pdev, IORESOURCE_MEM,
++					      phy_resnum++);
++	if (!priv->cmu_res) {
++		dev_err(dev, "cmu invalid resource\n");
++		ret = -EINVAL;
++		goto err_rxtx;
++	}
++	priv->cmu_regs = devm_ioremap_nocache(dev, priv->cmu_res->start,
++					      resource_size(priv->cmu_res));
++	if (!priv->cmu_regs) {
++		dev_err(dev, "cmu ioremap failed\n");
++		ret = -ENOMEM;
++		goto err_rxtx;
++	}
++
++	return 0;
++
++err_rxtx:
++	devm_iounmap(dev, priv->rxtx_regs);
++	devm_release_mem_region(dev, priv->rxtx_res->start,
++				resource_size(priv->rxtx_res));
++
++	return ret;
++}
++
++static void amd_xgbe_phy_unmap_resources(struct amd_xgbe_phy_priv *priv)
++{
++	struct device *dev = priv->dev;
++
++	devm_iounmap(dev, priv->cmu_regs);
++
++	devm_iounmap(dev, priv->rxtx_regs);
++	devm_release_mem_region(dev, priv->rxtx_res->start,
++				resource_size(priv->rxtx_res));
++}
++
++#ifdef CONFIG_ACPI
++static int amd_xgbe_phy_acpi_support(struct amd_xgbe_phy_priv *priv)
++{
++	struct platform_device *phy_pdev = priv->pdev;
++	struct acpi_device *adev = priv->adev;
++	struct device *dev = priv->dev;
++	const union acpi_object *property;
++	int ret;
++
++	/* Map the memory resources */
++	ret = amd_xgbe_phy_map_resources(priv, phy_pdev, 2);
++	if (ret)
++		return ret;
++
++	/* Get the device serdes channel property */
++	ret = acpi_dev_get_property(adev, XGBE_PHY_CHANNEL_PROPERTY,
++				    ACPI_TYPE_INTEGER, &property);
++	if (ret) {
++		dev_err(dev, "unable to obtain %s acpi property\n",
++			XGBE_PHY_CHANNEL_PROPERTY);
++		goto err_resources;
++	}
++	priv->serdes_channel = property->integer.value;
++
++	/* Get the device speed set property */
++	ret = acpi_dev_get_property(adev, XGBE_PHY_SPEEDSET_PROPERTY,
++				    ACPI_TYPE_INTEGER, &property);
++	if (ret) {
++		dev_err(dev, "unable to obtain %s acpi property\n",
++			XGBE_PHY_SPEEDSET_PROPERTY);
++		goto err_resources;
++	}
++	priv->speed_set = property->integer.value;
++
++	return 0;
++
++err_resources:
++	amd_xgbe_phy_unmap_resources(priv);
++
++	return ret;
++}
++#else	/* CONFIG_ACPI */
++static int amd_xgbe_phy_acpi_support(struct amd_xgbe_phy_priv *priv)
++{
++	return -EINVAL;
++}
++#endif	/* CONFIG_ACPI */
++
++#ifdef CONFIG_OF
++static int amd_xgbe_phy_of_support(struct amd_xgbe_phy_priv *priv)
++{
++	struct platform_device *phy_pdev;
++	struct device_node *bus_node;
++	struct device_node *phy_node;
++	struct device *dev = priv->dev;
++	const __be32 *property;
++	int ret;
++
++	bus_node = priv->dev->of_node;
++	phy_node = of_parse_phandle(bus_node, "phy-handle", 0);
++	if (!phy_node) {
++		dev_err(dev, "unable to parse phy-handle\n");
++		return -EINVAL;
++	}
++
++	phy_pdev = of_find_device_by_node(phy_node);
++	if (!phy_pdev) {
++		dev_err(dev, "unable to obtain phy device\n");
++		ret = -EINVAL;
++		goto err_put;
++	}
++
++	/* Map the memory resources */
++	ret = amd_xgbe_phy_map_resources(priv, phy_pdev, 0);
++	if (ret)
++		goto err_put;
++
++	/* Get the device serdes channel property */
++	property = of_get_property(phy_node, XGBE_PHY_CHANNEL_PROPERTY, NULL);
++	if (!property) {
++		dev_err(dev, "unable to obtain %s property\n",
++			XGBE_PHY_CHANNEL_PROPERTY);
++		ret = -EINVAL;
++		goto err_resources;
++	}
++	priv->serdes_channel = be32_to_cpu(*property);
++
++	/* Get the device speed set property */
++	property = of_get_property(phy_node, XGBE_PHY_SPEEDSET_PROPERTY, NULL);
++	if (property)
++		priv->speed_set = be32_to_cpu(*property);
++
++	of_node_put(phy_node);
++
++	return 0;
++
++err_resources:
++	amd_xgbe_phy_unmap_resources(priv);
++
++err_put:
++	of_node_put(phy_node);
++
++	return ret;
++}
++#else	/* CONFIG_OF */
++static int amd_xgbe_phy_of_support(struct amd_xgbe_phy_priv *priv)
++{
++	return -EINVAL;
++}
++#endif	/* CONFIG_OF */
++
+ static int amd_xgbe_phy_probe(struct phy_device *phydev)
+ {
+ 	struct amd_xgbe_phy_priv *priv;
+-	struct platform_device *pdev;
+ 	struct device *dev;
+ 	char *wq_name;
+-	const __be32 *property;
+-	unsigned int speed_set;
+ 	int ret;
+ 
+-	if (!phydev->dev.of_node)
++	if (!phydev->bus || !phydev->bus->parent)
+ 		return -EINVAL;
+ 
+-	pdev = of_find_device_by_node(phydev->dev.of_node);
+-	if (!pdev)
+-		return -EINVAL;
+-	dev = &pdev->dev;
++	dev = phydev->bus->parent;
+ 
+ 	wq_name = kasprintf(GFP_KERNEL, "%s-amd-xgbe-phy", phydev->bus->name);
+-	if (!wq_name) {
+-		ret = -ENOMEM;
+-		goto err_pdev;
+-	}
++	if (!wq_name)
++		return -ENOMEM;
+ 
+ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv) {
+@@ -1319,86 +1430,54 @@ static int amd_xgbe_phy_probe(struct phy_device *phydev)
+ 		goto err_name;
+ 	}
+ 
+-	priv->pdev = pdev;
++	priv->pdev = to_platform_device(dev);
++	priv->adev = ACPI_COMPANION(dev);
+ 	priv->dev = dev;
+ 	priv->phydev = phydev;
+ 
+-	/* Get the device mmio areas */
+-	priv->rxtx_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	priv->rxtx_regs = devm_ioremap_resource(dev, priv->rxtx_res);
+-	if (IS_ERR(priv->rxtx_regs)) {
+-		dev_err(dev, "rxtx ioremap failed\n");
+-		ret = PTR_ERR(priv->rxtx_regs);
++	if (priv->adev && !acpi_disabled)
++		ret = amd_xgbe_phy_acpi_support(priv);
++	else
++		ret = amd_xgbe_phy_of_support(priv);
++	if (ret)
+ 		goto err_priv;
+-	}
+-
+-	priv->sir0_res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+-	priv->sir0_regs = devm_ioremap_resource(dev, priv->sir0_res);
+-	if (IS_ERR(priv->sir0_regs)) {
+-		dev_err(dev, "sir0 ioremap failed\n");
+-		ret = PTR_ERR(priv->sir0_regs);
+-		goto err_rxtx;
+-	}
+-
+-	priv->sir1_res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
+-	priv->sir1_regs = devm_ioremap_resource(dev, priv->sir1_res);
+-	if (IS_ERR(priv->sir1_regs)) {
+-		dev_err(dev, "sir1 ioremap failed\n");
+-		ret = PTR_ERR(priv->sir1_regs);
+-		goto err_sir0;
+-	}
+ 
+-	/* Get the device speed set property */
+-	speed_set = 0;
+-	property = of_get_property(dev->of_node, XGBE_PHY_SPEEDSET_PROPERTY,
+-				   NULL);
+-	if (property)
+-		speed_set = be32_to_cpu(*property);
+-
+-	switch (speed_set) {
+-	case 0:
+-		priv->speed_set = AMD_XGBE_PHY_SPEEDSET_1000_10000;
+-		break;
+-	case 1:
+-		priv->speed_set = AMD_XGBE_PHY_SPEEDSET_2500_10000;
++	switch (priv->speed_set) {
++	case AMD_XGBE_PHY_SPEEDSET_1000_10000:
++	case AMD_XGBE_PHY_SPEEDSET_2500_10000:
+ 		break;
+ 	default:
+ 		dev_err(dev, "invalid amd,speed-set property\n");
+ 		ret = -EINVAL;
+-		goto err_sir1;
++		goto err_resources;
+ 	}
+ 
+ 	priv->link = 1;
+ 
++	ret = phy_read_mmd(phydev, MDIO_MMD_PCS, MDIO_CTRL2);
++	if (ret < 0)
++		goto err_resources;
++	if ((ret & MDIO_PCS_CTRL2_TYPE) == MDIO_PCS_CTRL2_10GBR)
++		priv->mode = AMD_XGBE_MODE_KR;
++	else
++		priv->mode = AMD_XGBE_MODE_KX;
++
+ 	mutex_init(&priv->an_mutex);
+ 	INIT_WORK(&priv->an_work, amd_xgbe_an_state_machine);
+ 	priv->an_workqueue = create_singlethread_workqueue(wq_name);
+ 	if (!priv->an_workqueue) {
+ 		ret = -ENOMEM;
+-		goto err_sir1;
++		goto err_resources;
+ 	}
+ 
+ 	phydev->priv = priv;
+ 
+ 	kfree(wq_name);
+-	of_dev_put(pdev);
+ 
+ 	return 0;
+ 
+-err_sir1:
+-	devm_iounmap(dev, priv->sir1_regs);
+-	devm_release_mem_region(dev, priv->sir1_res->start,
+-				resource_size(priv->sir1_res));
+-
+-err_sir0:
+-	devm_iounmap(dev, priv->sir0_regs);
+-	devm_release_mem_region(dev, priv->sir0_res->start,
+-				resource_size(priv->sir0_res));
+-
+-err_rxtx:
+-	devm_iounmap(dev, priv->rxtx_regs);
+-	devm_release_mem_region(dev, priv->rxtx_res->start,
+-				resource_size(priv->rxtx_res));
++err_resources:
++	amd_xgbe_phy_unmap_resources(priv);
+ 
+ err_priv:
+ 	devm_kfree(dev, priv);
+@@ -1406,9 +1485,6 @@ err_priv:
+ err_name:
+ 	kfree(wq_name);
+ 
+-err_pdev:
+-	of_dev_put(pdev);
+-
+ 	return ret;
+ }
+ 
+@@ -1425,18 +1501,7 @@ static void amd_xgbe_phy_remove(struct phy_device *phydev)
+ 	flush_workqueue(priv->an_workqueue);
+ 	destroy_workqueue(priv->an_workqueue);
+ 
+-	/* Release resources */
+-	devm_iounmap(dev, priv->sir1_regs);
+-	devm_release_mem_region(dev, priv->sir1_res->start,
+-				resource_size(priv->sir1_res));
+-
+-	devm_iounmap(dev, priv->sir0_regs);
+-	devm_release_mem_region(dev, priv->sir0_res->start,
+-				resource_size(priv->sir0_res));
+-
+-	devm_iounmap(dev, priv->rxtx_regs);
+-	devm_release_mem_region(dev, priv->rxtx_res->start,
+-				resource_size(priv->rxtx_res));
++	amd_xgbe_phy_unmap_resources(priv);
+ 
+ 	devm_kfree(dev, priv);
+ }
+-- 
+1.9.1
+
