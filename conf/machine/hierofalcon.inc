@@ -2,7 +2,7 @@
 #@NAME: AMD Hierofalcon
 #@DESCRIPTION: Cortex-A57
 
-require conf/machine/include/arch-armv8.inc
+require conf/machine/include/arm64/arch-armv8.inc
 
 PREFERRED_PROVIDER_virtual/kernel ?= "linux-hierofalcon"
 
