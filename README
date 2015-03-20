@@ -2,3 +2,50 @@ meta-hierofalcon
 ================
 
 This is the location for AMD Hierofalcon maintained BSP.
+
+Build Instructions:
+================
+
+# git clone git://git.yoctoproject.org/poky -b dizzy
+# cd poky
+# wget http://www.openenealinux.org/hierofalcon/download/patches/0001-archiver.bbclass-set-correct-tasks-order.patch
+# git apply 0001-archiver.bbclass-set-correct-tasks-order.patch
+
+# git clone https://git.linaro.org/openembedded/meta-linaro.git -b dizzy
+# cd meta-linaro
+# wget http://www.openenealinux.org/hierofalcon/download/patches/0001-meta-linaro-fixes-for-dizzy-branch.patch
+# git apply 0001-meta-linaro-fixes-for-dizzy-branch.patch
+# cd ..
+
+# git clone https://github.com/OpenEneaLinux/meta-oel.git -b dizzy
+
+# git clone https://github.com/OpenEneaLinux/meta-hierofalcon.git -b dizzy
+
+# git clone git://git.openembedded.org/meta-openembedded -b dizzy
+
+# source oe-init-build-en
+
+Update  conf/local.conf:
+
+MACHINE = "hierofalcon"
+DISTRO = "oel"
+
+Update conf/bblayer.conf
+
+  <PATH>/poky/meta \
+  <PATH>/poky/meta-yocto \
+  <PATH>/poky/meta-yocto-bsp \
+  <PATH>/poky/meta-oel \
+  <PATH>/poky/meta-hierofalcon \
+  <PATH>/poky/meta-linaro/meta-aarch64 \
+  <PATH>/poky/meta-linaro/meta-linaro \
+  <PATH>/poky/meta-linaro/meta-linaro-toolchain \
+  <PATH>/poky/meta-openembedded/meta-filesystems \
+  <PATH>/poky/meta-openembedded/meta-networking \
+  <PATH>/poky/meta-openembedded/meta-oe \
+  <PATH>/poky/meta-openembedded/meta-python \
+
+
+Build the image:
+
+# bitbake core-image-minimal
