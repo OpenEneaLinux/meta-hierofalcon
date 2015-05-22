@@ -3,6 +3,12 @@ From: Adrian Calianu <adrian.calianu@enea.com>
 Date: Mon, 23 Feb 2015 17:10:32 +0100
 Subject: [PATCH 1/1] Wire in support for poweroff via UEFI.
 
+If UEFI Runtime Services are available, they are preferred over direct
+PSCI calls or other methods to reset the system. For the reset case,
+we need to hook into machine_restart(), as the arm_pm_restart function
+pointer may be overwritten by modules.
+
+Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
 Signed-off-by: Adrian Calianu <adrian.calianu@enea.com>
 ---
  arch/arm64/kernel/efi.c | 37 +++++++++++++++++++++++++++++++++++++

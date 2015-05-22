@@ -9,6 +9,7 @@ AArch64 when the ABI says we shouldn't be, and relying on glibc to
 fix things up for us when we're loaded. However, SELinux will deny us
 mucking with the stack, and hit us with execmem AVCs.
 
+Signed-off-by: Kyle McMartin <kyle@redhat.com>
 Signed-off-by: Adrian Calianu <adrian.calianu@enea.com>
 ---
  arch/arm64/include/asm/elf.h | 3 ++-

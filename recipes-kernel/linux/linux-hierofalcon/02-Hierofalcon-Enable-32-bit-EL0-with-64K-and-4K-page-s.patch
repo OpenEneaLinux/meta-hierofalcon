@@ -7,6 +7,9 @@ Hierofalcon is able to switch to aarch32 EL0 only with following setup:
 - Page Size 64K - 42bit VA
 - Page Size 4K  - 48bit VA
 
+commit 9f25e6ad58e1fb3b4d441e4c55635c4598a6fa94
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Signed-off-by: Alexander Graf <agraf@suse.de>
 Signed-off-by: Adrian Calianu <adrian.calianu@enea.com>
 ---
  arch/arm64/Kconfig | 5 +++--
