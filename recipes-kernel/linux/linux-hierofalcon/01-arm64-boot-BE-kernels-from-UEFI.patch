@@ -3,6 +3,19 @@ From: Adrian Calianu <adrian.calianu@enea.com>
 Date: Mon, 16 Feb 2015 13:56:36 +0100
 Subject: [PATCH 1/1] arm64: boot BE kernels from UEFI
 
+Adds support for booting BE kernels from UEFI. As UEFI is defined to
+be strictly little endian, some workarounds are required to combine a little
+endian EFI stub with a big endian kernel. Also, runtime services need to be
+wrapped so they can be executed in little endian mode.
+
+Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+
+This patch is the resulting of porting on 3.19 kernel of a patch set
+([RFC PATCH 00/10] arm64: boot BE kernels from UEFI) provided by
+Ard Biesheuvel ard.biesheuvel at linaro.org for 3.17 kernel. 
+
+http://lists.infradead.org/pipermail/linux-arm-kernel/2014-July/274208.html
+
 Signed-off-by: Adrian Calianu <adrian.calianu@enea.com>
 ---
  arch/arm64/Kconfig                          |  10 ++-
